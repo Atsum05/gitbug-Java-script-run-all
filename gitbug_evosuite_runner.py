@@ -105,19 +105,92 @@ def ensure_dir(path: Path, label: str) -> None:
 def checkout_version(gitbug_repo: Path, bug_id: str, out_dir: Path, fixed: bool) -> None:
     """
     Checkout either the buggy or fixed version of a GitBug-Java bug.
-
-    The destination folder is deleted first so each run starts from a clean
-    checkout.
+    Uses the JSON data directly instead of the gitbug-java checkout command.
     """
+    import json
+    import pygit2
+    import uuid
+
     if out_dir.exists():
         shutil.rmtree(out_dir)
 
-    cmd = [sys.executable, "./gitbug-java", "checkout", bug_id, str(out_dir)]
+    # Find the JSON file for this bug_id
+    # bug_id format: "AuthMe-ConfigMe-7bf10c513479"
+    # JSON files: "AuthMe-ConfigMe.json" with commit_hash starting with "7bf10c513479"
+    bugs_dir = gitbug_repo / "data" / "bugs"
+    parts = bug_id.split("-")
+    commit_short = parts[-1]
+
+    bug_data = None
+    for json_file in bugs_dir.glob("*.json"):
+            with open(json_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if data.get("commit_hash", "").startswith(commit_short):
+                        bug_data = data
+                        break
+            if bug_data is not None:
+                break
+
+    if bug_data is None:
+        raise RuntimeError(f"No JSON found for bug_id: {bug_id}")
+
+    clone_url = bug_data["clone_url"]
+    commit_hash = bug_data["commit_hash"]
+    previous_commit_hash = bug_data["previous_commit_hash"]
+    bug_patch = bug_data.get("bug_patch", "")
+    test_patch = bug_data.get("test_patch", "")
+    non_code_patch = bug_data.get("non_code_patch", "")
+
+    # Clone the repo
+    logging.info(f"Cloning {clone_url} to {out_dir}")
+    repo = pygit2.clone_repository(clone_url, str(out_dir))
+
+    subprocess.run(
+        ["git", "config", "gc.auto", "0"],
+        cwd=str(out_dir),
+        capture_output=True,
+    )
+
+    def set_commit(repo, commit_str):
+        commit = repo.revparse_single(commit_str)
+        repo.checkout_tree(commit)
+        repo.create_tag(
+            str(uuid.uuid4()),
+            commit.id,
+            pygit2.GIT_OBJECT_COMMIT,
+            commit.author,
+            commit.message,
+        )
+        repo.set_head(commit.id)
 
     if fixed:
-        cmd.append("--fixed")
+        # Fixed: checkout the fix commit
+        set_commit(repo, commit_hash)
+    else:
+        # Buggy: checkout previous commit and apply test patch
+        set_commit(repo, previous_commit_hash)
+        if non_code_patch and bug_patch:
+            repo.apply(pygit2.Diff.parse_diff(non_code_patch))
+        if test_patch:
+            repo.apply(pygit2.Diff.parse_diff(test_patch))
 
-    run_cmd(cmd, cwd=gitbug_repo)
+    # Remove existing workflows
+    workflows_dir = out_dir / ".github" / "workflows"
+    if workflows_dir.exists():
+        for wf in list(workflows_dir.glob("*.yml")) + list(workflows_dir.glob("*.yaml")):
+            wf.unlink()
+
+    # Write gitbug.json
+    bug_data["fixed"] = fixed
+    with open(out_dir / "gitbug.json", "w") as f:
+        json.dump(bug_data, f)
 
 
 def compile_maven_project(

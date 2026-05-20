@@ -11,14 +11,13 @@ from typing import Dict, List, Set, Tuple
 
 # Local paths for my machine. These are intentionally kept at the top so they
 # are easy to adjust if the project is moved to another computer.
-RUNNER = "/home/atsum/Documents/investigation/gitbug_evosuite_runner.py"
-GITBUG_REPO = "/home/atsum/Documents/gitbug-java"
-EVOSUITE_JAR = "/home/atsum/Desktop/evosuite-1.2.0.jar"
-JUNIT_JAR = "/home/atsum/.m2/repository/junit/junit/4.13.2/junit-4.13.2.jar"
-HAMCREST_JAR = "/home/atsum/.m2/repository/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar"
-
-BASE_WORK_ROOT = Path("/home/atsum/Documents/gitbug-batch")
-DEFAULT_BUGS_CSV = Path("/home/atsum/Documents/investigation/bugs.csv")
+RUNNER = "/home/vboxuser/tesis/gitbug-Java-script-run-all/gitbug_evosuite_runner.py"
+GITBUG_REPO = "/home/vboxuser/tesis/gitbug-java"
+EVOSUITE_JAR = "/home/vboxuser/tesis/evosuite/shaded/target/evosuite-shaded-1.2.1-SNAPSHOT.jar"
+JUNIT_JAR = "/home/vboxuser/.m2/repository/junit/junit/4.13.2/junit-4.13.2.jar"
+HAMCREST_JAR = "/home/vboxuser/.m2/repository/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar"
+BASE_WORK_ROOT = Path("/home/vboxuser/tesis/gitbug-batch")
+DEFAULT_BUGS_CSV = Path("/home/vboxuser/tesis/gitbug-Java-script-run-all/bugs.csv")
 RESULTS_CSV = BASE_WORK_ROOT / "results.csv"
 
 
@@ -536,3 +535,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
