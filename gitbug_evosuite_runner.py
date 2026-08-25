@@ -201,6 +201,61 @@ def checkout_version_json(gitbug_repo: Path, bug_id: str, out_dir: Path, fixed: 
         json.dump(bug_data, f)
 
 
+
+
+def checkout_version_json_direct(json_path, out_dir, fixed=False):
+    """
+    Checkout de la version buggy o fixed, cargando directamente un archivo
+    JSON individual (de data_split/) en vez de buscarlo por bug_id en
+    data/bugs/. Misma logica que checkout_version_json, pero sin busqueda.
+    """
+    import json as _json
+    with open(json_path, "r", encoding="utf-8") as f:
+        bug_data = _json.load(f)
+
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+
+    clone_url = bug_data["clone_url"]
+    commit_hash = bug_data["commit_hash"]
+    previous_commit_hash = bug_data["previous_commit_hash"]
+    test_patch = bug_data.get("test_patch", "")
+    non_code_patch = bug_data.get("non_code_patch", "")
+    bug_patch = bug_data.get("bug_patch", "")
+
+    repo = pygit2.clone_repository(clone_url, str(out_dir))
+    subprocess.run(["git", "config", "gc.auto", "0"], cwd=str(out_dir), capture_output=True)
+
+    def set_commit(target_hash):
+        commit = repo.revparse_single(target_hash)
+        repo.checkout_tree(commit)
+        repo.create_tag(
+            str(uuid.uuid4()),
+            commit.id,
+            pygit2.GIT_OBJECT_COMMIT,
+            commit.author,
+            commit.message,
+        )
+        repo.set_head(commit.id)
+
+    if fixed:
+        set_commit(commit_hash)
+    else:
+        set_commit(previous_commit_hash)
+        if non_code_patch and bug_patch:
+            repo.apply(pygit2.Diff.parse_diff(non_code_patch))
+        if test_patch:
+            repo.apply(pygit2.Diff.parse_diff(test_patch))
+
+    workflows_dir = out_dir / ".github" / "workflows"
+    if workflows_dir.exists():
+        for wf in list(workflows_dir.glob("*.yml")) + list(workflows_dir.glob("*.yaml")):
+            wf.unlink()
+
+    bug_data["fixed"] = fixed
+    with open(out_dir / "gitbug.json", "w") as f:
+        _json.dump(bug_data, f)
+
 def compile_maven_project(
     project_dir: Path,
     log_dir: Path,
@@ -592,6 +647,7 @@ def main() -> None:
 
     parser.add_argument("--gitbug-repo", required=True, help="Path to the gitbug-java repo")
     parser.add_argument("--bug-id", required=True, help="GitBug-Java bug ID")
+    parser.add_argument("--bug-json-path", default=None, help="Direct path to a split JSON bug file (alternative to --bug-id, skips data/bugs/ search)")
     parser.add_argument("--class-under-test", required=True, help="Fully qualified Java class name")
     parser.add_argument("--evosuite-jar", required=True, help="Path to evosuite-1.2.0.jar")
     parser.add_argument("--junit-jar", required=True, help="Path to junit-4.13.2.jar")
@@ -634,13 +690,15 @@ def main() -> None:
     log_dir = work_root / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    _checkout = checkout_version_json if args.checkout_mode == "json" else checkout_version
+    if args.bug_json_path:
+        _checkout_fn = lambda repo, bid, odir, fixed: checkout_version_json_direct(
+            Path(args.bug_json_path), odir, fixed
+        )
+    else:
+        _checkout_fn = checkout_version_json if args.checkout_mode == "json" else checkout_version
 
-    logging.info(f"Checking out buggy version (mode={args.checkout_mode})")
-    _checkout(gitbug_repo, args.bug_id, buggy_dir, fixed=False)
-
-    logging.info(f"Checking out fixed version (mode={args.checkout_mode})")
-    _checkout(gitbug_repo, args.bug_id, fixed_dir, fixed=True)
+    _checkout_fn(gitbug_repo, args.bug_id, buggy_dir, fixed=False)
+    _checkout_fn(gitbug_repo, args.bug_id, fixed_dir, fixed=True)
 
     print_changed_java_files(buggy_dir, fixed_dir)
 

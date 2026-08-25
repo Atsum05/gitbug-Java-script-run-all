@@ -393,6 +393,7 @@ def run_one_bug(
         str(seed),
     ]
 
+    cmd += ["--checkout-mode", "json"]
     if docker_image:
         cmd += ["--docker-image", docker_image]
 
