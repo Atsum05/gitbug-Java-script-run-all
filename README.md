@@ -1,644 +1,339 @@
-# GitBug-Java + EvoSuite Experiment Runner
+# GitBug-Java + EvoSuite Experiment
 
-This project contains a small automation pipeline for running EvoSuite experiments on GitBug-Java bugs.
-
-The main idea is simple: generate tests from the **fixed** version of a bug, then run the exact same generated tests on both the fixed and buggy versions. If the tests pass on fixed and fail on buggy, then the generated test suite revealed the bug.
-
-```text
-fixed = PASS
-buggy = FAIL
-```
-
-That is the strongest result.
+Generates tests with EvoSuite on the **fixed** version of a bug, then runs those same tests on both the fixed and buggy versions. If tests pass on fixed and fail on buggy → the bug is revealed.
 
 ---
 
-## 1. Important note about paths
+## Files
 
-The scripts use local paths from the machine where the experiment is being run. Before running anything, check the path constants near the top of the scripts.
-
-In `run_screened_bugs.py`, check values like:
-
-```python
-RUNNER = ".../gitbug_evosuite_runner.py"
-GITBUG_REPO = ".../gitbug-java"
-EVOSUITE_JAR = ".../evosuite-1.2.0.jar"
-JUNIT_JAR = ".../junit-4.13.2.jar"
-HAMCREST_JAR = ".../hamcrest-core-1.3.jar"
-BASE_WORK_ROOT = Path(".../gitbug-batch")
-DEFAULT_BUGS_CSV = Path(".../bugs.csv")
-```
-
-These should point to your own files and folders.
-
-For example, on my machine they may look like:
-
-```text
-GitBug-Java repo:   /home/atsum/Documents/gitbug-java
-Scripts folder:     /home/atsum/Documents/investigation
-EvoSuite jar:       /home/atsum/Desktop/evosuite-1.2.0.jar
-Batch output:       /home/atsum/Documents/gitbug-batch
-Input bugs CSV:     /home/atsum/Documents/investigation/bugs.csv
-```
-
-But if your folders are different, update the constants in the scripts before running.
-
-A good way to check a path is:
-
-```bash
-ls /path/to/file-or-folder
-```
-
-For example:
-
-```bash
-ls /path/to/gitbug-java
-ls /path/to/evosuite-1.2.0.jar
-ls /path/to/bugs.csv
-```
+| File | What it does |
+|---|---|
+| `run_screened_bugs.py` | **Main script.** Batch runner — loops bugs × seeds × java versions, calls the worker, writes `results.csv` |
+| `gitbug_evosuite_runner.py` | **Worker.** Runs the full EvoSuite pipeline for one (bug, class, seed, java) combination. Called automatically by the batch runner |
+| `setup.sh` | **First-time setup.** Checks prerequisites, clones gitbug-java, builds Docker images, and validates everything |
+| `bugs_java_assigned.csv` | Input bug list with `java_version` per row. Each bug runs with its assigned version only (77 bugs) |
+| `bugs.csv` | Input bug list without java version. Use with `--java-versions` to test both versions |
+| `screen_all_bugs.py` | Screens every bug in gitbug-java for Java 8/11 compile compatibility. Run to generate a fresh `bugs_java_assigned.csv` |
+| `assign_java_versions.py` | Assigns java versions from a `results.csv` baseline. Bugs that worked → Java 11, failed → Java 8 |
+| `analyze_evosuite_failures.py` | Post-run. Reads logs and classifies why EvoSuite failed (RMI crash, CFG error, classpath error, etc.) |
+| `docker/java8.Dockerfile` | Docker image with Java 8 + Maven |
+| `docker/java11.Dockerfile` | Docker image with Java 11 + Maven |
+| `docker/build.sh` | Builds both Docker images (run once before experiments) |
 
 ---
 
-## 2. Files in the workflow
+## Prerequisites
 
-### `gitbug_evosuite_runner.py`
-
-This is the **one-bug worker**.
-
-It runs the full EvoSuite workflow for one bug/class pair:
-
-1. Checkout the buggy version.
-2. Checkout the fixed version.
-3. Compile the fixed version.
-4. Generate EvoSuite tests on the fixed version.
-5. Compile the generated tests.
-6. Run the tests on the fixed version.
-7. Compile the buggy version.
-8. Run the same fixed-generated tests on the buggy version.
-9. Print a result summary.
-
-Most of the time, this file is called automatically by `run_screened_bugs.py`.
+- **Python 3.10+**
+- **Poetry** — used to run scripts inside the GitBug-Java environment
+- **Docker** — used to run Maven and EvoSuite in the correct Java version
+- **GitBug-Java** repo — [https://github.com/gitbugactions/gitbug-java](https://github.com/gitbugactions/gitbug-java)
+- **EvoSuite 1.2.0 jar** — download from [https://github.com/EvoSuite/evosuite/releases/tag/v1.2.0](https://github.com/EvoSuite/evosuite/releases/tag/v1.2.0)
+- **JUnit 4.13.2** and **Hamcrest 1.3** — auto-detected from `~/.m2` (downloaded automatically on first Maven build)
 
 ---
 
-### `run_screened_bugs.py`
+## Step 1 — Run setup.sh (recommended)
 
-This is the **batch runner**.
+`setup.sh` handles everything in one go: checks prerequisites, clones gitbug-java if needed, builds Docker images, and validates all paths.
 
-It reads bug/class pairs from a CSV file, calls `gitbug_evosuite_runner.py` for each row, and stores results in a CSV file.
-
-It supports:
-
-```text
---limit             run only the first N rows
---force             rerun even if previous results exist
---timeout           maximum time per bug, in seconds
---heap              Java heap size for EvoSuite
---cleanup-targets   delete Maven target/ folders after each bug to save disk
+```bash
+bash /path/to/investigation/setup.sh
 ```
 
-This is the script normally used for experiments.
+It will ask for:
+- Path to the cloned gitbug-java repo (or where to clone it)
+- Path to `evosuite-1.2.0.jar`
+
+At the end it prints the exact command to start the experiment.
+
+> If you prefer to set up manually, follow Steps 2–4 below instead.
 
 ---
 
-### `bugs.csv`
-
-This is the input list of bug/class pairs.
-
-Format:
-
-```csv
-bug_id,class_under_test
-semver4j-semver4j-10102b374298,org.semver4j.RangesList
-klausbrunner-solarpositioning-4d35aecb4840,net.e175.klaus.solarpositioning.DeltaT
-```
-
-Each row means:
-
-```text
-Run EvoSuite for this bug, targeting this Java class.
-```
-
-A bug can appear more than once if multiple classes changed:
-
-```csv
-klausbrunner-solarpositioning-79c0044373b4,net.e175.klaus.solarpositioning.Grena3
-klausbrunner-solarpositioning-79c0044373b4,net.e175.klaus.solarpositioning.SPA
-```
-
-In that case, each row is a separate bug-class experiment.
-
----
-
-### `screen_gitbug_candidates.py`
-
-This optional helper script finds possible candidates.
-
-It does not run EvoSuite. It only screens GitBug-Java bugs by checking:
-
-1. Can the buggy version be checked out?
-2. Can the fixed version be checked out?
-3. Which `.java` files changed?
-4. Can the fixed version compile with Maven?
-
-It writes candidate rows into:
-
-```text
-screened_candidates.csv
-```
-
-Only rows with `compile_pass` are good candidates for `bugs.csv`.
-
----
-
-## 3. Environment setup
-
-Run the scripts from the GitBug-Java Poetry environment.
-
-The general pattern is:
+## Step 2 — Clone and install GitBug-Java (manual)
 
 ```bash
-cd <GITBUG_REPO>
-poetry run python <SCRIPTS_DIR>/run_screened_bugs.py
-```
-
-For example, if the repository is in `/home/atsum/Documents/gitbug-java` and the scripts are in `/home/atsum/Documents/investigation`:
-
-```bash
-cd /home/atsum/Documents/gitbug-java
-poetry run python /home/atsum/Documents/investigation/run_screened_bugs.py
-```
-
-Do not run the script with plain `python` from another folder if GitBug-Java depends on Poetry. That can cause errors such as:
-
-```text
-ModuleNotFoundError: No module named 'gitbugactions'
-```
-
-If Java needs to be set manually, use the correct Java path for your machine. Example for Java 11 on Ubuntu:
-
-```bash
-export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
-export PATH="$JAVA_HOME/bin:$PATH"
-```
-
-The batch script can also set Java 11 automatically if the path exists on the machine.
-
----
-
-## 4. Running the batch script
-
-Replace the paths below with your real paths.
-
-### Run the first 5 bugs
-
-```bash
-cd <GITBUG_REPO>
-poetry run python <SCRIPTS_DIR>/run_screened_bugs.py --limit 5 --force
-```
-
-Example:
-
-```bash
-cd /home/atsum/Documents/gitbug-java
-poetry run python /home/atsum/Documents/investigation/run_screened_bugs.py --limit 5 --force
-```
-
-### Run the first 10 bugs
-
-```bash
-cd <GITBUG_REPO>
-poetry run python <SCRIPTS_DIR>/run_screened_bugs.py --limit 10 --force
-```
-
-### Run all bugs in `bugs.csv`
-
-```bash
-cd <GITBUG_REPO>
-poetry run python <SCRIPTS_DIR>/run_screened_bugs.py --force
-```
-
-### Run with a 2-minute timeout per bug
-
-Timeout is in seconds, so 2 minutes is `120`:
-
-```bash
-cd <GITBUG_REPO>
-poetry run python <SCRIPTS_DIR>/run_screened_bugs.py --timeout 120 --force
-```
-
-### Run with more EvoSuite heap
-
-```bash
-cd <GITBUG_REPO>
-poetry run python <SCRIPTS_DIR>/run_screened_bugs.py --heap 6g --force
-```
-
-### Clean Maven `target/` folders after each run
-
-```bash
-cd <GITBUG_REPO>
-poetry run python <SCRIPTS_DIR>/run_screened_bugs.py --cleanup-targets --force
-```
-
-This is useful if disk space becomes a problem.
-
----
-
-## 5. Output structure
-
-The batch script writes a summary CSV to:
-
-```text
-<BASE_WORK_ROOT>/results.csv
-```
-
-Example:
-
-```text
-/home/atsum/Documents/gitbug-batch/results.csv
-```
-
-Check it with:
-
-```bash
-cat <BASE_WORK_ROOT>/results.csv
-```
-
-Example:
-
-```bash
-cat /home/atsum/Documents/gitbug-batch/results.csv
-```
-
-Count result types:
-
-```bash
-cut -d, -f6 <BASE_WORK_ROOT>/results.csv | sort | uniq -c
-```
-
-Each bug/class run gets its own folder:
-
-```text
-<BASE_WORK_ROOT>/<bug-id>__<class-name>/
-```
-
-Inside that folder:
-
-```text
-buggy/
-fixed/
-logs/
-```
-
-Useful log files:
-
-```text
-logs/evosuite_fixed.log
-logs/compile_generated_tests.log
-logs/run_fixed.log
-logs/run_buggy.log
-logs/batch_driver_stdout_stderr.log
+git clone https://github.com/gitbugactions/gitbug-java.git /path/to/gitbug-java
+cd /path/to/gitbug-java
+poetry install
 ```
 
 ---
 
-## 6. Result meanings
-
-### `BUG-REVEALING`
-
-```text
-fixed = PASS
-buggy = FAIL
-```
-
-Best case. EvoSuite generated a valid test suite that exposes the bug.
-
-### `NO DIFFERENCE FOUND`
-
-```text
-fixed = PASS
-buggy = PASS
-```
-
-The generated tests are valid, but they do not reveal the bug.
-
-### `UNSTABLE/UNHELPFUL`
-
-```text
-fixed = FAIL
-buggy = FAIL
-```
-
-The tests fail even on the fixed version, so they are not reliable for bug detection.
-
-This can happen with flaky or overfitted EvoSuite assertions, especially in numerical or floating-point-heavy code.
-
-### `MIXED RESULT`
-
-```text
-fixed = FAIL
-buggy = PASS
-```
-
-Unusual. Inspect the logs carefully.
-
-### `EVOSUITE NO TESTS`
-
-EvoSuite did not create any `*_ESTest.java` files.
-
-Usually check:
+## Step 3 — Build Docker images (manual, once)
 
 ```bash
-cat <BUG_WORK_ROOT>/logs/evosuite_fixed.log
+bash /path/to/investigation/docker/build.sh
 ```
 
-Common causes include EvoSuite crashes, RMI/class-loading problems, or export failures.
-
-### `TIMEOUT`
-
-The run exceeded the timeout set by `--timeout`.
-
-The log should contain something like:
-
-```text
-[TIMEOUT] Killed after 120 seconds.
-```
-
-### `COMPILE FAILED`
-
-The project did not compile with Maven.
-
-### `TEST COMPILE FAILED`
-
-EvoSuite generated tests, but `javac` could not compile them.
-
----
-
-## 7. Checking one result manually
-
-For a specific bug-class folder:
+This creates `gitbug-java8` and `gitbug-java11`. Verify with:
 
 ```bash
-cd <BUG_WORK_ROOT>
-```
-
-Example:
-
-```bash
-cd /home/atsum/Documents/gitbug-batch/semver4j-semver4j-10102b374298__org_semver4j_RangesList
-```
-
-Check generated test source files:
-
-```bash
-find fixed/evosuite-tests -name "*.java"
-```
-
-Check compiled test files:
-
-```bash
-find fixed/evosuite-tests -name "*.class"
-```
-
-Check JUnit results:
-
-```bash
-cat logs/run_fixed.log
-cat logs/run_buggy.log
-```
-
-A strong bug-revealing case should have:
-
-```text
-run_fixed.log -> OK (...)
-run_buggy.log -> FAILURES!!!
+docker images | grep gitbug
 ```
 
 ---
 
-## 8. Running one bug manually
+## Step 4 — Validate setup
 
-Most runs should go through `run_screened_bugs.py`, but the worker can be called directly.
-
-Template:
+Run this to confirm all paths and Docker images are ready before starting:
 
 ```bash
-cd <GITBUG_REPO>
-poetry run python <SCRIPTS_DIR>/gitbug_evosuite_runner.py \
-  --gitbug-repo <GITBUG_REPO> \
-  --bug-id <BUG_ID> \
-  --class-under-test <FULLY_QUALIFIED_CLASS> \
-  --evosuite-jar <EVOSUITE_JAR> \
-  --junit-jar <JUNIT_JAR> \
-  --hamcrest-jar <HAMCREST_JAR> \
-  --work-root <WORK_ROOT> \
-  --heap 4g
+cd /path/to/gitbug-java
+
+poetry run python /path/to/investigation/run_screened_bugs.py \
+  --gitbug-repo /path/to/gitbug-java \
+  --evosuite-jar /path/to/evosuite-1.2.0.jar \
+  --check
 ```
 
-Example:
+Expected output:
+```
+── Paths ───────────────────────────────────────────────────────
+  ✓  Runner script: .../gitbug_evosuite_runner.py [OK]
+  ✓  GitBug-Java repo: .../gitbug-java [OK]
+  ✓  EvoSuite jar: .../evosuite-1.2.0.jar [OK]
+  ✓  JUnit jar: ~/.m2/.../junit-4.13.2.jar [OK]
+  ✓  Hamcrest jar: ~/.m2/.../hamcrest-core-1.3.jar [OK]
 
-```bash
-cd /home/atsum/Documents/gitbug-java
-poetry run python /home/atsum/Documents/investigation/gitbug_evosuite_runner.py \
-  --gitbug-repo /home/atsum/Documents/gitbug-java \
-  --bug-id semver4j-semver4j-10102b374298 \
-  --class-under-test org.semver4j.RangesList \
-  --evosuite-jar /home/atsum/Desktop/evosuite-1.2.0.jar \
-  --junit-jar /home/atsum/.m2/repository/junit/junit/4.13.2/junit-4.13.2.jar \
-  --hamcrest-jar /home/atsum/.m2/repository/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar \
-  --work-root /home/atsum/Documents/gitbug-batch/manual-semver \
-  --heap 4g
+── Docker images ────────────────────────────────────────────────
+  ✓  Java 8 (gitbug-java8): [OK]
+  ✓  Java 11 (gitbug-java11): [OK]
+
+All checks passed. Ready to run.
 ```
 
 ---
 
-## 9. Finding more candidate bugs
+## Step 5 — Test with a small run first
 
-Run the candidate screening script from the GitBug-Java Poetry environment:
-
-```bash
-cd <GITBUG_REPO>
-poetry run python <SCRIPTS_DIR>/screen_gitbug_candidates.py
-```
-
-It creates:
-
-```text
-screened_candidates.csv
-```
-
-Only rows with:
-
-```text
-compile_pass
-```
-
-should be copied into `bugs.csv`.
-
-To create `bugs.csv` from all compile-pass rows:
+Always test with a few bugs before running everything:
 
 ```bash
-python3 - <<'PY'
-import csv
+cd /path/to/gitbug-java
 
-src = "<SCRIPTS_DIR>/screened_candidates.csv"
-dst = "<SCRIPTS_DIR>/bugs.csv"
-
-seen = set()
-rows = []
-
-with open(src, newline="", encoding="utf-8") as f:
-    reader = csv.DictReader(f)
-    for row in reader:
-        if row["status"] != "compile_pass":
-            continue
-
-        bug_id = row["bug_id"].strip()
-        cls = row["class_under_test"].strip()
-
-        if not bug_id or not cls:
-            continue
-
-        key = (bug_id, cls)
-        if key in seen:
-            continue
-
-        seen.add(key)
-        rows.append({"bug_id": bug_id, "class_under_test": cls})
-
-with open(dst, "w", newline="", encoding="utf-8") as f:
-    writer = csv.DictWriter(f, fieldnames=["bug_id", "class_under_test"])
-    writer.writeheader()
-    writer.writerows(rows)
-
-print(f"Wrote {len(rows)} bug-class entries to {dst}")
-PY
+poetry run python /path/to/investigation/run_screened_bugs.py \
+  --gitbug-repo /path/to/gitbug-java \
+  --evosuite-jar /path/to/evosuite-1.2.0.jar \
+  --bugs-csv /path/to/investigation/bugs_java_assigned.csv \
+  --seeds 3147383999447 \
+  --limit 5
 ```
 
-Important: replace `<SCRIPTS_DIR>` with your actual scripts folder before running that block.
-
----
-
-## 10. Java version notes
-
-The screening script checks compilation with the Java version active in the environment.
-
-So if the current environment uses Java 11, then:
-
-```text
-compile_pass
+Expected output:
 ```
-
-means:
-
-```text
-This bug/class compiled with Java 11 on this machine.
-```
-
-It does not automatically test both Java 8 and Java 11.
-
-If needed, switch `JAVA_HOME` and rerun the screening script to test another Java version.
-
----
-
-## 11. Common issues
-
-### Poetry cannot find `pyproject.toml`
-
-Run from the GitBug-Java repo:
-
-```bash
-cd <GITBUG_REPO>
-poetry run python <SCRIPTS_DIR>/run_screened_bugs.py
-```
-
-or use:
-
-```bash
-poetry -C <GITBUG_REPO> run python <SCRIPTS_DIR>/run_screened_bugs.py
-```
-
-### `ModuleNotFoundError: gitbugactions`
-
-This usually means the script was run with system Python instead of Poetry.
-
-Use:
-
-```bash
-cd <GITBUG_REPO>
-poetry run python <SCRIPTS_DIR>/run_screened_bugs.py
-```
-
-### EvoSuite generated no tests
-
-Check:
-
-```bash
-cat <BUG_WORK_ROOT>/logs/evosuite_fixed.log
-```
-
-This may be an EvoSuite limitation, not necessarily a script bug.
-
-### Tests fail on both fixed and buggy
-
-This is usually classified as:
-
-```text
-UNSTABLE/UNHELPFUL
-```
-
-It often means the generated tests are brittle or overfitted.
-
-### Running all bugs takes too long
-
-Use:
-
-```bash
---limit 10
---timeout 120
-```
-
-Example:
-
-```bash
-cd <GITBUG_REPO>
-poetry run python <SCRIPTS_DIR>/run_screened_bugs.py --limit 10 --timeout 120 --force
+Loaded 5 bug(s) x 1 seed(s) = 5 total runs.
+Java versions: per-bug (from CSV)
+Workers:       1
+...
+[submitted] [1/5] some-bug :: some.Class :: seed=3147383999447 :: java=8
+[done 1/5] ...
+  fixed=PASS | buggy=FAIL | result=BUG-REVEALING
 ```
 
 ---
 
-## 12. Quick command reference
+## Running the full experiment
 
-Run first 5:
+All commands below require `--gitbug-repo` and `--evosuite-jar`. JUnit and Hamcrest are auto-detected from `~/.m2`.
 
-```bash
-cd <GITBUG_REPO>
-poetry run python <SCRIPTS_DIR>/run_screened_bugs.py --limit 5 --force
-```
-
-Run all:
+### Option A — All bugs, one seed, per-bug java version (77 runs, recommended)
 
 ```bash
-cd <GITBUG_REPO>
-poetry run python <SCRIPTS_DIR>/run_screened_bugs.py --force
+cd /path/to/gitbug-java
+
+poetry run python /path/to/investigation/run_screened_bugs.py \
+  --gitbug-repo /path/to/gitbug-java \
+  --evosuite-jar /path/to/evosuite-1.2.0.jar \
+  --bugs-csv /path/to/investigation/bugs_java_assigned.csv \
+  --seeds 3147383999447 \
+  --workers 4
 ```
 
-Run with 2-minute timeout:
+### Option B — All bugs, both java versions, one seed (154 runs)
 
 ```bash
-cd <GITBUG_REPO>
-poetry run python <SCRIPTS_DIR>/run_screened_bugs.py --timeout 120 --force
+cd /path/to/gitbug-java
+
+poetry run python /path/to/investigation/run_screened_bugs.py \
+  --gitbug-repo /path/to/gitbug-java \
+  --evosuite-jar /path/to/evosuite-1.2.0.jar \
+  --bugs-csv /path/to/investigation/bugs.csv \
+  --seeds 3147383999447 \
+  --java-versions 8 11 \
+  --workers 4
 ```
 
-Check results:
+### Option C — All bugs, all 30 seeds, per-bug java version (2310 runs)
+
+Full statistical experiment:
 
 ```bash
-cat <BASE_WORK_ROOT>/results.csv
+cd /path/to/gitbug-java
+
+poetry run python /path/to/investigation/run_screened_bugs.py \
+  --gitbug-repo /path/to/gitbug-java \
+  --evosuite-jar /path/to/evosuite-1.2.0.jar \
+  --bugs-csv /path/to/investigation/bugs_java_assigned.csv \
+  --seeds 3147383999447 9617663486099 5379124608314 4823761945872 9865472301598 \
+          4098156729301 4378296150428 8912357690412 4082159706387 5017574018895 \
+          3157718788187 8462097531802 8394051763254 7861948975955 5785033018534 \
+          4687593021847 1369827450193 8912045678210 4195939566797 5919993929691 \
+          8492013567021 4629875132408 7245638910523 4823167590241 7237611861410 \
+          4872395016821 4967023185649 6048152937021 9516437924806 8609571234567 \
+  --workers 4
 ```
 
-Count result types:
+---
+
+## Key flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--gitbug-repo` | `$GITBUG_REPO` env var | Path to the cloned gitbug-java repo |
+| `--evosuite-jar` | `$EVOSUITE_JAR` env var | Path to `evosuite-1.2.0.jar` |
+| `--work-root` | `~/gitbug-batch` | Where run folders and `results.csv` are written |
+| `--bugs-csv` | `bugs_java_assigned.csv` | Which bug list to use |
+| `--seeds` | first 5 seeds | EvoSuite random seeds |
+| `--java-versions` | `8 11` | Java versions to test (ignored if CSV has `java_version` column) |
+| `--workers` | `1` | Parallel bug runs. Use 4 on a 16 GB machine, up to 6–8 on 32 GB |
+| `--limit N` | no limit | Run only the first N bugs |
+| `--timeout N` | `1800` | Seconds allowed per run |
+| `--heap` | `4g` | Java heap for EvoSuite per worker |
+| `--force` | off | Re-run even if results already exist |
+| `--reset` | off | Delete `results.csv` before starting (fresh slate) |
+| `--cleanup-targets` | off | Delete Maven `target/` after each run (saves disk space) |
+| `--check` | off | Validate all paths and Docker images, then exit |
+
+---
+
+## Choosing `--workers`
+
+Each worker runs one EvoSuite process (default `--heap 4g`). Keep `workers × heap` below your available RAM.
+
+| RAM | Recommended `--workers` |
+|---|---|
+| 8 GB | 2 |
+| 16 GB | 4 |
+| 32 GB | 6 |
+
+Monitor RAM during the first run with `htop`. If swap is used, reduce workers.
+
+---
+
+## Output
+
+Results are written to `<work-root>/results.csv` (default `~/gitbug-batch/results.csv`).
+
+Each run also gets its own folder:
+```
+<work-root>/<bug_id>__<class>__seed_<N>__java<V>/
+  buggy/        ← buggy checkout
+  fixed/        ← fixed checkout + generated tests
+  logs/
+    evosuite_fixed.log               ← EvoSuite output
+    batch_driver_stdout_stderr.log   ← full run log
+```
+
+### Result meanings
+
+| Result | fixed | buggy | Meaning |
+|---|---|---|---|
+| `BUG-REVEALING` | PASS | FAIL | Best case — bug is detected |
+| `NO DIFFERENCE FOUND` | PASS | PASS | Tests valid but don't expose the bug |
+| `UNSTABLE/UNHELPFUL` | FAIL | FAIL | Tests fail on both — not reliable |
+| `EVOSUITE NO TESTS` | — | — | EvoSuite crashed or produced no tests |
+| `EVOSUITE FAILED` | — | — | EvoSuite process exited with an error |
+| `COMPILE FAILED` | — | — | Maven could not compile the project |
+| `RUNNER ERROR` | — | — | Unexpected script-level error |
+| `TIMEOUT` | — | — | Run exceeded `--timeout` |
+
+---
+
+## Monitoring a running experiment
+
+Check how many results have been written:
+```bash
+watch -n 5 'wc -l ~/gitbug-batch/results.csv'
+```
+
+Check active Docker containers (one per worker):
+```bash
+watch -n 3 'docker ps --format "table {{.Names}}\t{{.Status}}"'
+```
+
+Stream results as they land:
+```bash
+tail -f ~/gitbug-batch/results.csv
+```
+
+---
+
+## Post-run analysis
+
+### Classify why EvoSuite failed
 
 ```bash
-cut -d, -f6 <BASE_WORK_ROOT>/results.csv | sort | uniq -c
+python3 /path/to/investigation/analyze_evosuite_failures.py
 ```
+
+Reads logs, classifies failures by category, writes `evosuite_failures_analysis.csv`.
+
+### Re-assign java versions from a baseline run
+
+```bash
+python3 /path/to/investigation/assign_java_versions.py \
+  --results-csv ~/gitbug-batch/results.csv \
+  --out /path/to/investigation/bugs_java_assigned.csv
+```
+
+Bugs with `BUG-REVEALING` or `NO DIFFERENCE FOUND` → `java_version=11`. Everything else → `java_version=8`.
+
+### Screen all bugs for Java compatibility
+
+To regenerate `bugs_java_assigned.csv` from scratch (screens all bugs in gitbug-java):
+
+```bash
+cd /path/to/gitbug-java
+
+poetry run python /path/to/investigation/screen_all_bugs.py
+```
+
+Supports `--resume` to continue an interrupted run and `--limit N` for testing.
+
+---
+
+## Why Docker
+
+EvoSuite 1.2.0 was designed for Java 8. On Java 11+, some projects fail with:
+```
+Unsupported class file major version 55
+```
+
+Docker lets each bug run inside the correct Java environment without installing multiple Java versions on the host. Python runs on the host; Maven and EvoSuite run inside the container. All paths are mounted at the same absolute location inside the container so classpath resolution works correctly.
+
+---
+
+## Common errors
+
+### `ModuleNotFoundError: No module named 'gitbugactions'`
+Run the script with `poetry run` from inside the GitBug-Java repo, not with system Python.
+
+### `RUNNER ERROR` on every bug
+Run `--check` to validate all paths. One of the jars or directories is likely missing or wrong.
+
+### `EVOSUITE NO TESTS` for many bugs
+Check `logs/evosuite_fixed.log` inside the bug's folder. Common causes: RMI crash, classpath error, or an EvoSuite internal bug with that class.
+
+### `EVOSUITE FAILED` with `Unknown property: starting_port`
+This means `-Dstarting_port` was passed after `-jar` instead of before it. This is a known EvoSuite 1.2.0 quirk — the property must be a JVM system property. The current script handles this correctly.
+
+### Docker permission errors
+```bash
+sudo usermod -aG docker $USER
+# then log out and back in
+```
+
+### `Poetry could not find a pyproject.toml`
+You ran `poetry run` from the wrong directory. Always `cd` into the gitbug-java repo first before running `poetry run python ...`.
